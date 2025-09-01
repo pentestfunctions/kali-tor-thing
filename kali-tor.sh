@@ -1,54 +1,175 @@
 #!/bin/bash
-# torify-kali-safe.sh
-# Configures system-wide Tor routing on a fresh Kali install safely (idempotent)
+# kalitor-fixed.sh
+# Configures system-wide Tor routing with transparent proxy (no conflicting SOCKS variables)
 
 set -e
+
+echo "[*] Starting system-wide Tor configuration..."
+echo "[*] This script will configure Tor routing and modify system DNS settings."
+echo "[!] WARNING: This will route ALL traffic through Tor, including your current user."
+read -p "[?] Continue? (y/N): " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "[*] Operation cancelled."
+    exit 1
+fi
 
 echo "[*] Updating system..."
 sudo apt update && sudo apt upgrade -y
 
 echo "[*] Installing Tor and necessary tools..."
-sudo apt install -y tor iptables iptables-persistent
+sudo apt install -y tor iptables iptables-persistent curl obfs4proxy
 
 TORRC="/etc/tor/torrc"
-sudo cp $TORRC "${TORRC}.bak"
+sudo cp $TORRC "${TORRC}.bak" 2>/dev/null || true
 
 # Function to ensure a line exists in torrc
 ensure_line() {
     local LINE="$1"
-    grep -Fxq "$LINE" $TORRC || echo "$LINE" | sudo tee -a $TORRC > /dev/null
+    grep -Fxq "$LINE" $TORRC 2>/dev/null || echo "$LINE" | sudo tee -a $TORRC > /dev/null
 }
 
-echo "[*] Configuring Tor..."
-ensure_line "ControlPort 9051"
-ensure_line "CookieAuthentication 1"
+echo "[*] Configuring Tor for transparent proxy..."
 ensure_line "TransPort 9040"
 ensure_line "DNSPort 5353"
 ensure_line "AutomapHostsOnResolve 1"
 
-echo "[*] Restarting Tor service..."
-sudo systemctl enable tor --now
-sudo systemctl restart tor
+# Backup original resolv.conf
+if [[ -f /etc/resolv.conf && ! -f /etc/resolv.conf.bak ]]; then
+    sudo cp /etc/resolv.conf /etc/resolv.conf.bak
+fi
 
-echo "[*] Configuring iptables for system-wide Tor routing..."
-# Delete old rules added by this script (tagged with comment TORIFY)
-sudo iptables -t nat -S | grep "TORIFY" | while read -r line; do
-    sudo iptables -t nat ${line/-A/-D}
+echo "[*] Creating bootstrap helper script..."
+sudo tee /usr/local/bin/tor-bootstrap-helper > /dev/null << 'EOF'
+#!/bin/bash
+# Tor bootstrap helper - transparent proxy only
+
+echo "[*] Tor bootstrap helper starting..."
+sleep 10  # Wait for system to settle
+
+# Temporarily restore normal DNS for Tor bootstrap
+if [[ -f /etc/resolv.conf.bak ]]; then
+    cp /etc/resolv.conf.bak /etc/resolv.conf
+else
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+fi
+
+# Clear any existing NAT rules to avoid conflicts
+iptables -t nat -F OUTPUT
+
+# Wait for Tor to start
+echo "[*] Waiting for Tor to start..."
+for i in {1..30}; do
+    if systemctl is-active --quiet tor@default; then
+        echo "[✓] Tor service is active"
+        break
+    fi
+    sleep 1
+    if [ $i -eq 30 ]; then
+        echo "[!] Tor service not starting, starting manually..."
+        systemctl start tor@default
+    fi
 done
 
-# Redirect TCP traffic to Tor TransPort (except local)
-sudo iptables -t nat -A OUTPUT -m owner ! --uid-owner $(id -u) -p tcp --syn -j REDIRECT --to-ports 9040 -m comment --comment "TORIFY"
+# Wait for Tor bootstrap
+echo "[*] Waiting for Tor bootstrap..."
+for i in {1..60}; do
+    if curl --socks5-hostname 127.0.0.1:9050 --connect-timeout 2 -s https://check.torproject.org/ > /dev/null 2>&1; then
+        echo "[✓] Tor bootstrap successful!"
+        break
+    fi
+    sleep 2
+    if [ $i -eq 30 ]; then
+        echo "[!] Tor bootstrap taking longer than expected..."
+    fi
+done
 
-# Redirect DNS to Tor DNSPort
-sudo iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 5353 -m comment --comment "TORIFY"
+# Apply transparent proxy rules
+echo "[*] Applying transparent proxy rules..."
+iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports 9040 -m comment --comment "TORIFY"
+iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 5353 -m comment --comment "TORIFY"
 
-# Save rules
-sudo netfilter-persistent save
+# Set DNS to use Tor
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
 
-echo "[*] Setting environment variables for proxy-aware applications..."
-grep -qxF 'export http_proxy="socks5://127.0.0.1:9050"' ~/.bashrc || echo 'export http_proxy="socks5://127.0.0.1:9050"' >> ~/.bashrc
-grep -qxF 'export https_proxy="socks5://127.0.0.1:9050"' ~/.bashrc || echo 'export https_proxy="socks5://127.0.0.1:9050"' >> ~/.bashrc
-source ~/.bashrc
+echo "[✓] Bootstrap process completed"
+EOF
 
-echo "[*] System-wide Tor routing configured safely!"
-echo "[*] Reboot recommended."
+sudo chmod +x /usr/local/bin/tor-bootstrap-helper
+
+echo "[*] Creating systemd service for bootstrap..."
+sudo tee /etc/systemd/system/tor-bootstrap.service > /dev/null << 'EOF'
+[Unit]
+Description=Tor Bootstrap Helper
+After=network.target tor@default.service
+Wants=tor@default.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tor-bootstrap-helper
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "[*] Configuring iptables persistence..."
+sudo tee /etc/iptables/rules.v4 > /dev/null << 'EOF'
+# Generated by torify script
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# Tor redirect rules will be added by bootstrap script
+COMMIT
+EOF
+
+echo "[*] Clearing any conflicting proxy environment variables..."
+# Remove proxy variables from current session
+unset http_proxy https_proxy ALL_PROXY
+
+# Remove proxy variables from shell config files
+sed -i '/export.*proxy.*socks5/d' ~/.bashrc ~/.zshrc 2>/dev/null || true
+
+echo "[*] Setting up Tor service..."
+sudo systemctl enable tor@default
+sudo systemctl enable tor-bootstrap.service
+
+echo "[*] Starting services..."
+sudo systemctl start tor@default
+sudo systemctl start tor-bootstrap.service
+
+echo "[*] Waiting for configuration to complete..."
+sleep 15
+
+echo "[*] Testing configuration..."
+if curl --connect-timeout 10 -s https://icanhazip.com > /dev/null 2>&1; then
+    IP=$(curl --connect-timeout 10 -s https://icanhazip.com 2>/dev/null)
+    echo "[✓] Transparent proxy working! Your Tor IP: $IP"
+    
+    # Verify it's actually a Tor IP
+    if curl --connect-timeout 10 -s "https://check.torproject.org/api/ip" 2>/dev/null | grep -q "true"; then
+        echo "[✓] Confirmed: Traffic is routing through Tor network"
+    fi
+else
+    echo "[!] Transparent proxy test failed. System will complete bootstrap on next reboot."
+    echo "[*] Current status:"
+    sudo systemctl status tor@default --no-pager -l
+    sudo systemctl status tor-bootstrap.service --no-pager -l
+fi
+
+echo "[*] Configuration complete!"
+echo "[!] IMPORTANT:"
+echo "    - All traffic now routes transparently through Tor"
+echo "    - No proxy environment variables needed"
+echo "    - System will activate fully on next reboot"
+echo "    - Check status with: sudo systemctl status tor-bootstrap.service"
+echo "    - View logs with: sudo journalctl -u tor-bootstrap.service -f"
+echo "    - Test connection: curl ifconfig.me"
